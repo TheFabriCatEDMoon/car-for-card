@@ -45,6 +45,10 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 # 应用层代码：从 2.0_Car_Test_C8_MX/Hardware 移植过来
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+    Middlewares/Third_Party/FreeRTOS/Source/list.c
+    Middlewares/Third_Party/FreeRTOS/Source/queue.c
+    Middlewares/Third_Party/FreeRTOS/Source/tasks.c
+    Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM3/port.c
     Hardware/app_console.c
     Hardware/app_log.c
     Hardware/app_params.c
@@ -59,6 +63,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/Hardware
+    ${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/include
+    ${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM3
 )
 
 # Add project symbols (macros)

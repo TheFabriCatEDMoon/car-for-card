@@ -35,6 +35,8 @@
 #include "app_params.h"
 #include "app_console.h"
 #include "config.h"   /* 所有可调参数与结构常量 */
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -108,7 +110,6 @@ static volatile bool rx_ready_flag;
 static bool rx_discard;
 static volatile char card_name[10];
 static VisionFrame vision;           /* 解析后的视觉帧 */
-static uint32_t last_display_ms;
 static uint32_t last_telemetry_ms;
 static uint32_t last_params_ms;
 static CarStatus logged_status;
@@ -116,13 +117,23 @@ static bool logged_backing;          /* 倒转阶段开始/结束的日志边沿
 static bool self_test_ok;
 static bool s_log_enabled = true;
 /* 工作模式：1..4 循环，每次按 KEY2 加 1，到 5 时回 1 */
-static uint8_t mode = 1;
+static volatile uint8_t mode = 1;
 static uint16_t last_key2_presses;
 /* 目标压线次数（cross_count 达到它就停车）：mode1 固定 1，mode2 从卡片取 */
-static int16_t cross_target;
-static bool cross_target_valid;
+static volatile int16_t cross_target;
+static volatile bool cross_target_valid;
 static bool cross_done;              /* 已经因为到达目标停过车 */
 static CarStatus prev_status;
+
+#define APPLICATION_TASK_STACK_WORDS 768U
+#define DISPLAY_TASK_STACK_WORDS     512U
+
+static StaticTask_t application_task_tcb;
+static StaticTask_t display_task_tcb;
+static StackType_t application_task_stack[APPLICATION_TASK_STACK_WORDS];
+static StackType_t display_task_stack[DISPLAY_TASK_STACK_WORDS];
+static StaticTask_t idle_task_tcb;
+static StackType_t idle_task_stack[configMINIMAL_STACK_SIZE];
 
 /* USER CODE END PV */
 
@@ -141,6 +152,8 @@ static void PrintVofaFrame(void);
 static int16_t CardNumber(const volatile char *name);
 static void ApplyMode(uint8_t m);
 static void Timers_Match20Timing(void);
+static void ApplicationTask(void *argument);
+static void DisplayTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -412,8 +425,12 @@ static int16_t CardNumber(const volatile char *name)
 /* 切换 mode 时设定：目标压线次数 + 启动延时 */
 static void ApplyMode(uint8_t m)
 {
+    uint32_t start_delay_ms = (m == 2U) ? 1000U : 0U;
+    uint32_t irq_state = __get_PRIMASK();
+
+    __disable_irq();
     car.start_pending = false;
-    car.start_delay_ms = (m == 2U) ? 1000U : 0U;   /* mode2：KEY1 后等 1 秒 */
+    car.start_delay_ms = start_delay_ms;
     cross_done = false;
 
     if (m == 2U) {
@@ -423,10 +440,11 @@ static void ApplyMode(uint8_t m)
         cross_target = 1;             /* mode1 / 3 / 4：固定 1 次 */
         cross_target_valid = true;
     }
+    __set_PRIMASK(irq_state);
 
     log_info("[MODE] %u  target=%d valid=%d delay=%u ms",
              (unsigned)m, (int)cross_target, (int)cross_target_valid,
-             (unsigned)car.start_delay_ms);
+             (unsigned)start_delay_ms);
 }
 
 static void RefreshDisplay(void)
@@ -441,6 +459,9 @@ static void RefreshDisplay(void)
     char bits[9];
     char text[32];
     unsigned i;
+    uint8_t display_mode;
+    int16_t display_cross_target;
+    bool display_cross_target_valid;
     uint32_t irq_state = __get_PRIMASK();
 
     __disable_irq();
@@ -448,6 +469,9 @@ static void RefreshDisplay(void)
     for (i = 0; i < sizeof(card); ++i) {
         card[i] = card_name[i];
     }
+    display_mode = mode;
+    display_cross_target = cross_target;
+    display_cross_target_valid = cross_target_valid;
     __set_PRIMASK(irq_state);
 
     for (i = 0; i < 8U; ++i) {
@@ -462,7 +486,7 @@ static void RefreshDisplay(void)
                                    : 0U]);
     ShowRow(0, text);
     /* 右上角显示 mode：6x8 字体每字符 6 px，"M:n" 占 18 px */
-    (void)snprintf(text, sizeof(text), "M:%u", (unsigned)mode);
+    (void)snprintf(text, sizeof(text), "M:%u", (unsigned)display_mode);
     OLED_ShowString(CAR_OLED_MODE_X, 0, text, OLED_6X8);
     (void)snprintf(text, sizeof(text), "G:%s E:%+d", bits, (int)data.error_x10);
     ShowRow(2, text);
@@ -476,8 +500,8 @@ static void RefreshDisplay(void)
     ShowRow(5, text);
     /* Cross 行最右侧显示目标圈数 cross_target：右对齐，6x8 字体每字符 6 px，
        屏幕宽 128 px，所以起点 = 128 - 6 * 字符数。没设目标时显示 "T:-"。 */
-    if (cross_target_valid) {
-        (void)snprintf(text, sizeof(text), "T:%d", (int)cross_target);
+    if (display_cross_target_valid) {
+        (void)snprintf(text, sizeof(text), "T:%d", (int)display_cross_target);
     } else {
         (void)snprintf(text, sizeof(text), "T:-");
     }
@@ -634,6 +658,160 @@ static void SelfTest_Run(void)
              (unsigned)(car.status == CAR_BENCH));
     logged_status = car.status;
 }
+
+static void ApplicationTask(void *argument)
+{
+    (void)argument;
+
+    for (;;) {
+        uint32_t now;
+        uint32_t irq_state;
+        bool backing;
+        bool start_pending;
+        bool log_wanted;
+
+        Console_Poll();
+        Vision_Poll();
+
+        log_wanted = (g_params.log_enable != 0U) && !AppLog_VofaMode();
+        if (log_wanted != s_log_enabled) {
+            s_log_enabled = log_wanted;
+            AppLog_SetEnabled(log_wanted);
+        }
+
+        now = HAL_GetTick();
+
+        if (g_params.telemetry_ms > 0U &&
+            (uint32_t)(now - last_telemetry_ms) >= g_params.telemetry_ms) {
+            last_telemetry_ms = now;
+            if (AppLog_VofaMode()) {
+                PrintVofaFrame();
+            } else {
+                PrintTelemetry();
+            }
+        }
+
+        if (g_params.params_ms > 0U &&
+            (uint32_t)(now - last_params_ms) >= g_params.params_ms) {
+            last_params_ms = now;
+            Params_Dump();
+        }
+
+        if (telemetry.status != logged_status) {
+            log_info("[SM] %s -> %s (lost=%lu, pwm=%u/%u)",
+                     StatusName(logged_status), StatusName(telemetry.status),
+                     (unsigned long)telemetry.lost_frames,
+                     (unsigned)telemetry.left_pwm, (unsigned)telemetry.right_pwm);
+            logged_status = telemetry.status;
+        }
+
+        /* 停车倒转阶段的开始/结束各打一条，方便确认 back_time 生效 */
+        irq_state = __get_PRIMASK();
+        __disable_irq();
+        backing = car.backing;
+        __set_PRIMASK(irq_state);
+        if (backing != logged_backing) {
+            logged_backing = backing;
+            if (backing) {
+                log_info("[BACK] reverse %u ms at pwm %u", (unsigned)CAR_BACK_MS,
+                         (unsigned)CAR_BACK_PWM);
+            } else {
+                log_info("[BACK] done, wheels stopped");
+            }
+        }
+
+        /* 每按一次 KEY2，mode 加 1；到 5 回到 1 */
+        if (telemetry.key2_presses != last_key2_presses) {
+            last_key2_presses = telemetry.key2_presses;
+            ++mode;
+            if (mode >= 5U) {
+                mode = 1U;
+            }
+            ApplyMode(mode);
+        }
+
+        /*
+         * mode 2：延时等待起步的这 1 秒里，看视觉卡片决定目标圈数。
+         * 牌面是 2 时目标为 2 圈，其余情况目标为 3 圈。
+         */
+        irq_state = __get_PRIMASK();
+        __disable_irq();
+        start_pending = car.start_pending;
+        __set_PRIMASK(irq_state);
+        if (mode == 2U && start_pending) {
+            cross_target = (CardNumber(card_name) == 2) ? 2 : 3;
+            cross_target_valid = true;
+        }
+
+        if ((telemetry.status == CAR_RUNNING || telemetry.status == CAR_SEARCH) &&
+            cross_target_valid && !cross_done &&
+            telemetry.cross_count == cross_target) {
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
+            CarControl_Stop(&car);
+            __set_PRIMASK(primask);
+            cross_done = true;
+            log_info("[TARGET] cross_count=%d reached target %d, car stopped",
+                     (int)telemetry.cross_count, (int)cross_target);
+        }
+
+        if (telemetry.status == CAR_RUNNING &&
+            prev_status != CAR_RUNNING && prev_status != CAR_SEARCH) {
+            if (cross_done) {
+                cross_done = false;
+                log_info("[TARGET] new run, counter re-armed");
+            }
+            if (mode == 2U) {
+                log_info("[M2] target = %d laps (card 2 -> 2, otherwise -> 3)",
+                         (int)cross_target);
+            }
+        }
+        prev_status = telemetry.status;
+
+        vTaskDelay(pdMS_TO_TICKS(CAR_LOOP_DELAY_MS));
+    }
+}
+
+static void DisplayTask(void *argument)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t last_refresh_ms = HAL_GetTick() - CAR_DISPLAY_MS;
+
+    (void)argument;
+    for (;;) {
+        uint32_t now = HAL_GetTick();
+
+        if ((uint32_t)(now - last_refresh_ms) >= CAR_DISPLAY_MS) {
+            last_refresh_ms = now;
+            if (!AppLog_VofaMode()) {
+                RefreshDisplay();
+            }
+        }
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10U));
+    }
+}
+
+void vApplicationGetIdleTaskMemory(StaticTask_t **task_tcb_buffer,
+                                   StackType_t **task_stack_buffer,
+                                   uint32_t *stack_size)
+{
+    *task_tcb_buffer = &idle_task_tcb;
+    *task_stack_buffer = idle_task_stack;
+    *stack_size = configMINIMAL_STACK_SIZE;
+}
+
+void vApplicationTickHook(void)
+{
+    HAL_IncTick();
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *task_name)
+{
+    (void)task;
+    (void)task_name;
+    Error_Handler();
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -744,122 +922,22 @@ int main(void)
 
   /* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
+  if (xTaskCreateStatic(ApplicationTask, "application",
+                        APPLICATION_TASK_STACK_WORDS, NULL,
+                        tskIDLE_PRIORITY + 2U,
+                        application_task_stack, &application_task_tcb) == NULL ||
+      xTaskCreateStatic(DisplayTask, "display",
+                        DISPLAY_TASK_STACK_WORDS, NULL,
+                        tskIDLE_PRIORITY + 1U,
+                        display_task_stack, &display_task_tcb) == NULL)
   {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-    uint32_t now;
-    bool log_wanted;
-
-    Console_Poll();
-    Vision_Poll();
-
-    log_wanted = (g_params.log_enable != 0U) && !AppLog_VofaMode();
-    if (log_wanted != s_log_enabled) {
-      s_log_enabled = log_wanted;
-      AppLog_SetEnabled(log_wanted);
-    }
-
-    now = HAL_GetTick();
-
-    if (g_params.telemetry_ms > 0U &&
-        (uint32_t)(now - last_telemetry_ms) >= g_params.telemetry_ms) {
-      last_telemetry_ms = now;
-      if (AppLog_VofaMode()) {
-        PrintVofaFrame();      /* VOFA 模式：只发 CSV，不发 [T] 文本 */
-      } else {
-        PrintTelemetry();
-      }
-    }
-
-    if (g_params.params_ms > 0U &&
-        (uint32_t)(now - last_params_ms) >= g_params.params_ms) {
-      last_params_ms = now;
-      Params_Dump();
-    }
-
-    if ((uint32_t)(now - last_display_ms) >= CAR_DISPLAY_MS) {
-      last_display_ms = now;
-      /* VOFA 模式不刷屏：调参看曲线，屏幕不重要，省下来的时间给数据帧 */
-      if (!AppLog_VofaMode()) {
-        RefreshDisplay();
-      }
-    }
-
-    if (telemetry.status != logged_status) {
-      log_info("[SM] %s -> %s (lost=%lu, pwm=%u/%u)",
-               StatusName(logged_status), StatusName(telemetry.status),
-               (unsigned long)telemetry.lost_frames,
-               (unsigned)telemetry.left_pwm, (unsigned)telemetry.right_pwm);
-      logged_status = telemetry.status;
-    }
-
-    /* 停车倒转阶段的开始/结束各打一条，方便确认 back_time 生效 */
-    if (car.backing != logged_backing) {
-      logged_backing = car.backing;
-      if (car.backing) {
-        log_info("[BACK] reverse %u ms at pwm %u", (unsigned)CAR_BACK_MS,
-                 (unsigned)CAR_BACK_PWM);
-      } else {
-        log_info("[BACK] done, wheels stopped");
-      }
-    }
-
-    /* 每按一次 KEY2，mode 加 1；到 5 回到 1（所以显示是 1→2→3→4→1） */
-    if (telemetry.key2_presses != last_key2_presses) {
-      last_key2_presses = telemetry.key2_presses;
-      ++mode;
-      if (mode >= 5U) {
-        mode = 1U;
-      }
-      ApplyMode(mode);
-    }
-
-    /*
-     * mode 2：延时等待起步的这 1 秒里，看视觉卡片决定目标圈数。
-     *   牌面是 2（2C/2D/2H/2S 或 "2"） → cross_target = 2
-     *   其余（其它牌、None、没读到）      → cross_target = 3
-     * 所以 mode 2 一定有目标，不会出现"不自动停"的情况。
-     */
-    if (mode == 2U && car.start_pending) {
-      cross_target = (CardNumber(card_name) == 2) ? 2 : 3;
-      cross_target_valid = true;
-    }
-
-    /* 所有模式统一：cross_count 到达 cross_target 就停车 */
-    if ((telemetry.status == CAR_RUNNING || telemetry.status == CAR_SEARCH) &&
-        cross_target_valid && !cross_done &&
-        telemetry.cross_count == cross_target) {
-      uint32_t primask = __get_PRIMASK();
-      __disable_irq();
-      CarControl_Stop(&car);
-      __set_PRIMASK(primask);
-      cross_done = true;
-      log_info("[TARGET] cross_count=%d reached target %d, car stopped",
-               (int)telemetry.cross_count, (int)cross_target);
-    }
-
-    /* 新一轮起步（READY -> RUN）时清掉"已到目标"标记 */
-    if (telemetry.status == CAR_RUNNING &&
-        prev_status != CAR_RUNNING && prev_status != CAR_SEARCH) {
-      if (cross_done) {
-        cross_done = false;
-        log_info("[TARGET] new run, counter re-armed");
-      }
-      if (mode == 2U) {
-        log_info("[M2] target = %d laps (card 2 -> 2, otherwise -> 3)",
-                 (int)cross_target);
-      }
-    }
-    prev_status = telemetry.status;
-
-    HAL_Delay(CAR_LOOP_DELAY_MS);
+    log_error("[INIT] FreeRTOS task creation failed");
+    Error_Handler();
   }
 
-  /* USER CODE END 3 */
+  log_info("[INIT] FreeRTOS scheduler starting");
+  vTaskStartScheduler();
+  Error_Handler();
 }
 
 /**
