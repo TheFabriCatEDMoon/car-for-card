@@ -10,8 +10,8 @@
                 "-s", "D:\\openocd\\xpack-openocd-0.12.0-7\\openocd\\scripts",
                 "-f", "interface/cmsis-dap.cfg",
                 "-c", "transport select swd",
-                "-c", "adapter speed 500",
                 "-f", "target/stm32f1x.cfg",
+                "-c", "adapter speed 500",
                 "-c", "program build/Debug/2.1_Car_Test_C8_MX.elf verify reset exit"
             ],
             "options": {

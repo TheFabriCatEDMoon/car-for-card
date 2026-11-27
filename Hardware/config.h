@@ -40,9 +40,9 @@
 
 /* ---- A1. 常用：速度与转向 ------------------------------------------------ */
 
-#define CAR_BASE_SPEED             22.0f   /* BASE_SPEED：直道目标速度；增大可提速。范围 0~40 */
+#define CAR_BASE_SPEED             25.0f   /* BASE_SPEED：直道目标速度；增大可提速。范围 0~40 */
 #define CAR_MIN_BASE_SPEED         4.0f    /* MIN_BASE_SPEED：弯道最低速度；太快就降低。范围 0~40，需 <= BASE_SPEED */
-#define CAR_SPEED_RAMP             0.5f    /* SPEED_RAMP：每 10 ms 加速步长；越大起步越快。范围 0.05~5 */
+#define CAR_SPEED_RAMP             1.5f    /* SPEED_RAMP：每 10 ms 加速步长；越大起步越快。范围 0.05~5 */
 #define CAR_CURVE_SLOWDOWN         1.5f    /* CURVE_SLOWDOWN：偏差越大降速越多；范围 0~5 */
 #define CAR_MAX_WHEEL_TARGET      40.0f    /* MAX_WHEEL_TARGET：单轮速度上限；BASE_SPEED 被卡住时检查此项。范围 0~100 */
 #define CAR_MAX_TURN               20.0f    /* MAX_TURN：转向差速上限；太迟钝可加，摆动大可减。范围 0~30 */
