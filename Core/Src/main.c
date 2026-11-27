@@ -150,6 +150,7 @@ static uint32_t card_restart_ms;
 static bool buzzer_active;           /* 蜂鸣器正在响（1 s 后自己关） */
 static uint32_t buzzer_off_ms;
 static bool cards_view;              /* OLED 正在显示卡片网格 */
+static bool cards_latched;           /* mode 3 压过线后锁住卡片页，直到切模式 */
 
 #define APPLICATION_TASK_STACK_WORDS 768U
 #define DISPLAY_TASK_STACK_WORDS     512U
@@ -609,6 +610,7 @@ static void ApplyMode(uint8_t m)
     car.start_pending = false;
     car.start_delay_ms = start_delay_ms;
     cross_done = false;
+    cards_latched = false;            /* 换模式后重新判定要不要显示卡片页 */
 
     if (m == 2U) {
         cross_target = 0;             /* mode2：等 KEY1 之后从卡片取 */
@@ -702,8 +704,11 @@ static void RefreshDisplay(void)
     display_cross_target_valid = cross_target_valid;
     __set_PRIMASK(irq_state);
 
-    /* mode 3 压线一次后：整屏清空，改显示 6 张卡片 */
-    show_cards = (display_mode == 3U) && (data.cross_count == 1);
+    /* mode 3 只要 cross_count >= 1：整屏清空，改显示 6 张卡片，并且一直保持 */
+    if (display_mode == 3U && data.cross_count >= 1) {
+        cards_latched = true;
+    }
+    show_cards = (display_mode == 3U) && cards_latched;
     if (show_cards != cards_view) {
         OLED_Clear();
         cards_view = show_cards;
