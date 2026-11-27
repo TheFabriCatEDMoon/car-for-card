@@ -6,7 +6,7 @@
 #define configUSE_PREEMPTION                    1
 #define configUSE_TIME_SLICING                  1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION  0
-#define configUSE_TICK_HOOK                     1
+#define configUSE_TICK_HOOK                     0
 #define configUSE_IDLE_HOOK                     0
 #define configUSE_16_BIT_TICKS                  0
 #define configCPU_CLOCK_HZ                      72000000UL
@@ -57,6 +57,13 @@
 
 #define vPortSVCHandler     SVC_Handler
 #define xPortPendSVHandler  PendSV_Handler
-#define xPortSysTickHandler SysTick_Handler
+
+/*
+ * SysTick_Handler 不在这里映射到 xPortSysTickHandler：
+ * HAL_Init() 会在调度器启动前就打开 SysTick 中断（HAL_Delay / 自检要用），
+ * 此时 FreeRTOS 还没有当前任务，直接进 xTaskIncrementTick() 会访问空指针。
+ * 真正的 SysTick_Handler 在 stm32f1xx_it.c 里，先 HAL_IncTick()，
+ * 调度器跑起来之后才转发给 xPortSysTickHandler()。
+ */
 
 #endif

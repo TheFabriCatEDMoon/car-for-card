@@ -23,6 +23,14 @@
     {
       "name": "stlink-gdbserver",
       "version": "7.14.0+st.2"
+    },
+    {
+      "name": "openocd-script",
+      "version": "2.3.0+st.1"
+    },
+    {
+      "name": "openocd-gdbserver",
+      "version": "0.12.1+st.2"
     }
   ]
 }

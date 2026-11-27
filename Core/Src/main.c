@@ -800,11 +800,6 @@ void vApplicationGetIdleTaskMemory(StaticTask_t **task_tcb_buffer,
     *stack_size = configMINIMAL_STACK_SIZE;
 }
 
-void vApplicationTickHook(void)
-{
-    HAL_IncTick();
-}
-
 void vApplicationStackOverflowHook(TaskHandle_t task, char *task_name)
 {
     (void)task;

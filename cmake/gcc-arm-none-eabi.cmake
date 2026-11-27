@@ -19,9 +19,15 @@ set(CMAKE_CXX_COMPILER_ID GNU)
 # arm-none-eabi- must be part of path environment
 set(TOOLCHAIN_PREFIX                arm-none-eabi-)
 
-set(CMAKE_C_COMPILER                ${TOOLCHAIN_PREFIX}gcc)
-set(CMAKE_ASM_COMPILER              ${CMAKE_C_COMPILER})
-set(CMAKE_CXX_COMPILER              ${TOOLCHAIN_PREFIX}g++)
+# 只写普通变量的话 CMake 不会把 CMAKE_<LANG>_COMPILER 放进 CMakeCache.txt，
+# 而 VS Code CMake Tools 生成调试配置时要读缓存里的编译器，缺了就报
+# "在缓存文件中找不到编译器"。这里解析成绝对路径并存成缓存变量。
+find_program(TOOLCHAIN_C_COMPILER   NAMES ${TOOLCHAIN_PREFIX}gcc REQUIRED)
+find_program(TOOLCHAIN_CXX_COMPILER NAMES ${TOOLCHAIN_PREFIX}g++ REQUIRED)
+
+set(CMAKE_C_COMPILER                ${TOOLCHAIN_C_COMPILER}   CACHE FILEPATH "")
+set(CMAKE_ASM_COMPILER              ${TOOLCHAIN_C_COMPILER}   CACHE FILEPATH "")
+set(CMAKE_CXX_COMPILER              ${TOOLCHAIN_CXX_COMPILER} CACHE FILEPATH "")
 set(CMAKE_LINKER                    ${TOOLCHAIN_PREFIX}g++)
 set(CMAKE_OBJCOPY                   ${TOOLCHAIN_PREFIX}objcopy)
 set(CMAKE_SIZE                      ${TOOLCHAIN_PREFIX}size)

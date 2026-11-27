@@ -22,6 +22,8 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,7 +48,7 @@
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN PFP */
-
+extern void xPortSysTickHandler(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -188,5 +190,23 @@ void USART2_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/*
+ * SysTick 被两个东西共用：
+ *   1. HAL 的 1 ms 时基（HAL_Init / HAL_RCC_ClockConfig 会打开 SysTick，
+ *      Track_Init 的 HAL_Delay(100)、OLED_Init 的 200 ms、自检都依赖它）；
+ *   2. FreeRTOS 的系统节拍（xPortSysTickHandler）。
+ * 只要调度器还没启动（pxCurrentTCB 为空），就不能进 xTaskIncrementTick()，
+ * 否则在 HAL_Init 之后的第一毫秒就会 HardFault。所以这里按调度器状态分流。
+ */
+void SysTick_Handler(void)
+{
+  HAL_IncTick();
+
+  if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+  {
+    xPortSysTickHandler();
+  }
+}
 
 /* USER CODE END 1 */
