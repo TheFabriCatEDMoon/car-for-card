@@ -150,6 +150,14 @@
 #define CAR_CARD_STOP_MS        2000U     /* 识别到 S/C 后停车多久再自动起步 */
 #define CAR_CARD_BEEP_MS        1000U     /* 停车期间蜂鸣器响多久 */
 
+/* ---- B10. mode 4 视觉卡片匹配 ------------------------------------------ */
+
+#define CAR_MATCH_SLOTS           12U     /* card1..card12：前 6 张算目标，后 6 张比对 */
+#define CAR_MATCH_LAP_TARGET       2U     /* mode 4 的 cross_target：跑 2 圈后停车 */
+#define CAR_MATCH_STOP_MS       2000U     /* 命中目标后停车多久再自动起步 */
+#define CAR_MATCH_PICK             3U     /* 每组取 3 张卡求和 */
+#define CAR_MATCH_COMBOS          20U     /* C(6,3) = 20 组 */
+
 /* ==========================================================================
  * C. 编译期检查：配错了直接报错，不用等上车才发现
  * ========================================================================== */
@@ -187,6 +195,11 @@
 
 #if (CAR_CARD_SLOTS < 6) || (CAR_CARD_TEXT_MAX < 2) || (CAR_CARD_BEEP_MS > CAR_CARD_STOP_MS)
 #error "Invalid card detection configuration (need 6 slots, BEEP <= STOP)"
+#endif
+
+#if (CAR_MATCH_SLOTS < 12) || (CAR_MATCH_COMBOS != 20) || \
+    (CAR_MATCH_PICK != 3) || (CAR_CARD_BEEP_MS > CAR_MATCH_STOP_MS)
+#error "Invalid mode 4 card matching configuration"
 #endif
 
 #endif /* CAR_CONFIG_ALL_H */
