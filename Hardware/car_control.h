@@ -74,4 +74,10 @@ void CarControl_Step(CarControl *car, uint8_t gray, uint16_t left_count,
 /* 外部强制停车（模式逻辑用），会回到 READY 并清掉电机输出 */
 void CarControl_Stop(CarControl *car);
 
+/* 外部立即停车（模式逻辑用）：不倒转，电机输出立刻清零 */
+void CarControl_StopNow(CarControl *car);
+
+/* 外部重新起步（模式逻辑用）：不经过 KEY1，下一帧开始循迹 */
+void CarControl_Resume(CarControl *car);
+
 #endif

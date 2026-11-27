@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Hardware/app_console.c
     Hardware/app_log.c
     Hardware/app_params.c
+    Hardware/buzzer.c
     Hardware/car_control.c
     Hardware/log.c
     Hardware/motor.c

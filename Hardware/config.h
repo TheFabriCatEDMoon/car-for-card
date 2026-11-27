@@ -142,6 +142,14 @@
 
 #define CAR_LINE_AVG_WINDOW        3U     /* LINE_AVG=1 时的滑动平均窗口帧数 */
 
+/* ---- B9. mode 3 视觉卡片识别 ------------------------------------------- */
+
+#define CAR_CARD_SLOTS             6U     /* card1..card6，最多记 6 张 */
+#define CAR_CARD_TEXT_MAX         10U     /* 卡名缓冲，和视觉标签 card_name 一样长 */
+#define CAR_CARD_WAIT_MS        2000U     /* 记完一张卡后 detect 关多久再打开 */
+#define CAR_CARD_STOP_MS        2000U     /* 识别到 S/C 后停车多久再自动起步 */
+#define CAR_CARD_BEEP_MS        1000U     /* 停车期间蜂鸣器响多久 */
+
 /* ==========================================================================
  * C. 编译期检查：配错了直接报错，不用等上车才发现
  * ========================================================================== */
@@ -175,6 +183,10 @@
 
 #if (CAR_VISION_LINE_MAX < 8) || (CAR_CONSOLE_LINE_MAX < 16) || (CAR_VOFA_LINE_MAX < 64)
 #error "Buffer sizes too small"
+#endif
+
+#if (CAR_CARD_SLOTS < 6) || (CAR_CARD_TEXT_MAX < 2) || (CAR_CARD_BEEP_MS > CAR_CARD_STOP_MS)
+#error "Invalid card detection configuration (need 6 slots, BEEP <= STOP)"
 #endif
 
 #endif /* CAR_CONFIG_ALL_H */

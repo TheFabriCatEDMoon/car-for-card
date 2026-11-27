@@ -30,6 +30,7 @@
 #include "motor.h"
 #include "track.h"
 #include "car_control.h"
+#include "buzzer.h"
 #include "log.h"
 #include "app_log.h"
 #include "app_params.h"
@@ -124,6 +125,31 @@ static volatile int16_t cross_target;
 static volatile bool cross_target_valid;
 static bool cross_done;              /* 已经因为到达目标停过车 */
 static CarStatus prev_status;
+
+/* ---- mode 3：视觉卡片识别 ------------------------------------------------
+ * detect = 1 时，每收到一个非 NONE 的标签就按顺序存进 card1..card6；
+ * 卡名最后一个字母（花色）是 S/C 就立刻停车、蜂鸣 1 s，2 s 后自动起步。
+ */
+static uint8_t detect = 1;                           /* 1 = 允许记录卡片 */
+static uint8_t detect_number = 0;                    /* 已经记了几张（0..6） */
+static const uint32_t wait_time = CAR_CARD_WAIT_MS;  /* 记完一张后的检测冷却 ms */
+static char card1[CAR_CARD_TEXT_MAX];
+static char card2[CAR_CARD_TEXT_MAX];
+static char card3[CAR_CARD_TEXT_MAX];
+static char card4[CAR_CARD_TEXT_MAX];
+static char card5[CAR_CARD_TEXT_MAX];
+static char card6[CAR_CARD_TEXT_MAX];
+/* detect_number 从 0 开始，所以 card(detect_number + 1) == cards[detect_number] */
+static char *const cards[CAR_CARD_SLOTS] = {
+    card1, card2, card3, card4, card5, card6
+};
+static bool detect_waiting;          /* detect 已清 0，等冷却结束再置 1 */
+static uint32_t detect_resume_ms;
+static bool card_restart_pending;    /* S/C 卡停车中，到点自动起步 */
+static uint32_t card_restart_ms;
+static bool buzzer_active;           /* 蜂鸣器正在响（1 s 后自己关） */
+static uint32_t buzzer_off_ms;
+static bool cards_view;              /* OLED 正在显示卡片网格 */
 
 #define APPLICATION_TASK_STACK_WORDS 768U
 #define DISPLAY_TASK_STACK_WORDS     512U
@@ -422,6 +448,157 @@ static int16_t CardNumber(const volatile char *name)
     }
 }
 
+/* 卡名的“字母部分”：取最后一个字符并转大写，10C → 'C'，AS → 'S'。
+   没有字母（纯数字、空串）返回 '\0'。 */
+static char CardLetter(const char *name)
+{
+    size_t length = strlen(name);
+    char c;
+
+    if (length == 0U) {
+        return '\0';
+    }
+    c = name[length - 1U];
+    if (c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
+    return (c >= 'A' && c <= 'Z') ? c : '\0';
+}
+
+/* 只认 S（黑桃）/ C（梅花）两种花色 */
+static bool CardIsStopSuit(const char *name)
+{
+    char suit = CardLetter(name);
+    return suit == 'S' || suit == 'C';
+}
+
+/* 进入 mode 3：清空 card1..card6，从第一张开始重新记 */
+static void CardDetect_Reset(void)
+{
+    unsigned i;
+    unsigned j;
+    uint32_t irq_state = __get_PRIMASK();
+
+    __disable_irq();
+    for (i = 0; i < CAR_CARD_SLOTS; ++i) {
+        for (j = 0; j < CAR_CARD_TEXT_MAX; ++j) {
+            cards[i][j] = '\0';
+        }
+    }
+    detect_number = 0;
+    __set_PRIMASK(irq_state);
+
+    log_info("[CARD] slots cleared, detect re-armed");
+}
+
+/* 离开 mode 3 / 本轮结束：取消停车等待、关蜂鸣器、恢复检测 */
+static void CardDetect_Cancel(void)
+{
+    card_restart_pending = false;
+    detect_waiting = false;
+    detect = 1;
+    if (buzzer_active) {
+        buzzer_active = false;
+        Buzzer_Off();
+    }
+}
+
+/*
+ * mode 3 的卡片状态机（主循环里每 1 ms 跑一次，不阻塞）：
+ *   1. 蜂鸣器响满 CAR_CARD_BEEP_MS 就关；
+ *   2. S/C 卡停车满 CAR_CARD_STOP_MS 后自动起步，从起步时刻开始算 detect 冷却；
+ *   3. 冷却结束把 detect 置 1；
+ *   4. detect = 1 且车在跑时，把非 NONE 的 card_name 依次存进 card1..card6。
+ */
+static void CardDetect_Poll(void)
+{
+    char name[CAR_CARD_TEXT_MAX];
+    uint32_t now = HAL_GetTick();
+    uint32_t irq_state;
+    unsigned i;
+
+    if (buzzer_active && (int32_t)(now - buzzer_off_ms) >= 0) {
+        buzzer_active = false;
+        Buzzer_Off();
+    }
+
+    if (card_restart_pending && (int32_t)(now - card_restart_ms) >= 0) {
+        card_restart_pending = false;
+        irq_state = __get_PRIMASK();
+        __disable_irq();
+        CarControl_Resume(&car);
+        __set_PRIMASK(irq_state);
+        detect = 0;
+        detect_waiting = true;
+        detect_resume_ms = now + wait_time;
+        log_info("[CARD] restart, detect off for %lu ms", (unsigned long)wait_time);
+    }
+
+    if (detect_number >= CAR_CARD_SLOTS) {
+        detect = 0;
+        detect_waiting = false;
+    } else if (detect_waiting && (int32_t)(now - detect_resume_ms) >= 0) {
+        detect_waiting = false;
+        detect = 1;
+    }
+
+    if (!detect || card_restart_pending) {
+        return;
+    }
+    /* 车没在跑就不记：停车时视觉还对着同一张卡，会重复记 */
+    if (telemetry.status != CAR_RUNNING && telemetry.status != CAR_SEARCH) {
+        return;
+    }
+
+    irq_state = __get_PRIMASK();
+    __disable_irq();
+    for (i = 0; i < CAR_CARD_TEXT_MAX; ++i) {
+        name[i] = card_name[i];
+    }
+    __set_PRIMASK(irq_state);
+
+    if (strcmp(name, "NONE") == 0 || detect_number >= CAR_CARD_SLOTS) {
+        return;
+    }
+
+    irq_state = __get_PRIMASK();
+    __disable_irq();
+    for (i = 0; i < CAR_CARD_TEXT_MAX; ++i) {
+        cards[detect_number][i] = name[i];
+    }
+    ++detect_number;
+    if (detect_number >= CAR_CARD_SLOTS) {
+        detect = 0;
+    }
+    __set_PRIMASK(irq_state);
+
+    log_info("[CARD] #%u %s letter=%c", (unsigned)detect_number, name,
+             CardLetter(name) ? CardLetter(name) : '-');
+
+    if (CardIsStopSuit(name)) {
+        irq_state = __get_PRIMASK();
+        __disable_irq();
+        CarControl_StopNow(&car);
+        __set_PRIMASK(irq_state);
+
+        Buzzer_Set(true);
+        buzzer_active = true;
+        buzzer_off_ms = now + CAR_CARD_BEEP_MS;
+        card_restart_pending = true;
+        card_restart_ms = now + CAR_CARD_STOP_MS;
+        detect = 0;                    /* 停车期间不再记录 */
+        detect_waiting = false;
+        log_info("[CARD] %s -> stop, beep %u ms, restart in %u ms", name,
+                 (unsigned)CAR_CARD_BEEP_MS, (unsigned)CAR_CARD_STOP_MS);
+    } else {
+        detect = 0;
+        detect_waiting = true;
+        detect_resume_ms = now + wait_time;
+        log_info("[CARD] %s -> detect off for %lu ms", name,
+                 (unsigned long)wait_time);
+    }
+}
+
 /* 切换 mode 时设定：目标压线次数 + 启动延时 */
 static void ApplyMode(uint8_t m)
 {
@@ -442,9 +619,52 @@ static void ApplyMode(uint8_t m)
     }
     __set_PRIMASK(irq_state);
 
+    /* mode 3 进来先清空卡片；其它模式把停车/鸣叫/等待全部取消 */
+    CardDetect_Cancel();
+    if (m == 3U) {
+        CardDetect_Reset();
+    }
+
     log_info("[MODE] %u  target=%d valid=%d delay=%u ms",
              (unsigned)m, (int)cross_target, (int)cross_target_valid,
              (unsigned)start_delay_ms);
+}
+
+/* 卡片网格里的一格：空槽显示 "-"，右列按屏幕右边对齐 */
+static void ShowCardCell(uint8_t x, uint8_t y, const char *text, bool right_align)
+{
+    char buffer[CAR_CARD_TEXT_MAX];
+    size_t length = 0;
+
+    if (text[0] == '\0') {
+        buffer[length++] = '-';
+        buffer[length] = '\0';
+    } else {
+        while (text[length] != '\0' && length < sizeof(buffer) - 1U) {
+            buffer[length] = text[length];
+            ++length;
+        }
+        buffer[length] = '\0';
+    }
+
+    if (right_align) {
+        x = (uint8_t)(128U - 6U * (unsigned)length);
+    }
+    OLED_ShowString(x, y, buffer, OLED_6X8);
+}
+
+/* card1..card6 两列显示：右列从上到下 1/2/3，左列从上到下 6/5/4 */
+static void ShowCardGrid(char grid[CAR_CARD_SLOTS][CAR_CARD_TEXT_MAX])
+{
+    static const uint8_t page[3] = {1U, 3U, 5U};
+    const char *const left[3] = {grid[5], grid[4], grid[3]};
+    const char *const right[3] = {grid[0], grid[1], grid[2]};
+    unsigned i;
+
+    for (i = 0; i < 3U; ++i) {
+        ShowCardCell(0U, page[i], left[i], false);
+        ShowCardCell(0U, page[i], right[i], true);
+    }
 }
 
 static void RefreshDisplay(void)
@@ -456,12 +676,15 @@ static void RefreshDisplay(void)
     };
     DisplaySnapshot data;
     char card[10];
+    char grid[CAR_CARD_SLOTS][CAR_CARD_TEXT_MAX];
     char bits[9];
     char text[32];
     unsigned i;
+    unsigned j;
     uint8_t display_mode;
     int16_t display_cross_target;
     bool display_cross_target_valid;
+    bool show_cards;
     uint32_t irq_state = __get_PRIMASK();
 
     __disable_irq();
@@ -469,10 +692,26 @@ static void RefreshDisplay(void)
     for (i = 0; i < sizeof(card); ++i) {
         card[i] = card_name[i];
     }
+    for (i = 0; i < CAR_CARD_SLOTS; ++i) {
+        for (j = 0; j < CAR_CARD_TEXT_MAX; ++j) {
+            grid[i][j] = cards[i][j];
+        }
+    }
     display_mode = mode;
     display_cross_target = cross_target;
     display_cross_target_valid = cross_target_valid;
     __set_PRIMASK(irq_state);
+
+    /* mode 3 压线一次后：整屏清空，改显示 6 张卡片 */
+    show_cards = (display_mode == 3U) && (data.cross_count == 1);
+    if (show_cards != cards_view) {
+        OLED_Clear();
+        cards_view = show_cards;
+    }
+    if (show_cards) {
+        ShowCardGrid(grid);
+        return;
+    }
 
     for (i = 0; i < 8U; ++i) {
         bits[i] = (data.gray & (1U << i)) ? '1' : '0';
@@ -743,6 +982,11 @@ static void ApplicationTask(void *argument)
             cross_target_valid = true;
         }
 
+        /* mode 3：记卡片、S/C 停车 + 蜂鸣 + 2 s 后自动起步 */
+        if (mode == 3U) {
+            CardDetect_Poll();
+        }
+
         if ((telemetry.status == CAR_RUNNING || telemetry.status == CAR_SEARCH) &&
             cross_target_valid && !cross_done &&
             telemetry.cross_count == cross_target) {
@@ -751,6 +995,9 @@ static void ApplicationTask(void *argument)
             CarControl_Stop(&car);
             __set_PRIMASK(primask);
             cross_done = true;
+            if (mode == 3U) {
+                CardDetect_Cancel();   /* 本轮跑完，不再自动起步 */
+            }
             log_info("[TARGET] cross_count=%d reached target %d, car stopped",
                      (int)telemetry.cross_count, (int)cross_target);
         }
@@ -884,6 +1131,8 @@ int main(void)
   log_info("[INIT] line sensor ready");
   OLED_Init();
   log_info("[INIT] OLED ready");
+  Buzzer_Init();
+  log_info("[INIT] buzzer ready (PC14, active low)");
 
   if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4) != HAL_OK ||
       HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||

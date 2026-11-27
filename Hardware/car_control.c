@@ -355,6 +355,25 @@ void CarControl_Stop(CarControl *car)
     StopWithBack(car);
 }
 
+/* 外部立即停车（模式逻辑用）：不走倒转，电机输出立刻清零 */
+void CarControl_StopNow(CarControl *car)
+{
+    car->status = CAR_READY;
+    car->start_pending = false;
+    car->backing = false;
+    StopDrive(car);
+}
+
+/* 外部重新起步（模式逻辑用）：不按 KEY1，下一帧从 READY 直接进循迹 */
+void CarControl_Resume(CarControl *car)
+{
+    car->start_pending = false;
+    car->backing = false;
+    car->valid_frames = 0;
+    StopDrive(car);
+    car->status = CAR_RUNNING;
+}
+
 void CarControl_Step(CarControl *car, uint8_t gray, uint16_t left_count,
                      uint16_t right_count, bool key1_pressed, bool key2_pressed)
 {
