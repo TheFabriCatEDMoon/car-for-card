@@ -3,83 +3,94 @@
 
 /*
  * ============================================================================
- *  config.h —— 全部可调量的唯一入口
+ *  config.h —— 调参面板
  * ============================================================================
  *
- *  第一部分（A）是**参数**：就是串口 `SET 名字 值` 能改的那 36 个量，
- *  这里定义的是它们的**上电默认值**。运行中改只影响本次，复位后回到这里。
+ *  初次调车建议先只改 A1「速度与转向」，其他参数保持默认：
+ *    - 车太慢：小幅增加 BASE_SPEED；若已经到 MAX_WHEEL_TARGET 上限，
+ *      再小幅增加 MAX_WHEEL_TARGET。
+ *      BASE_SPEED 高于 MAX_WHEEL_TARGET 时，单轮目标会被上限截住。
+ *    - 弯道太快：降低 MIN_BASE_SPEED，或增加 CURVE_SLOWDOWN。
+ *    - 起步太冲：降低 SPEED_RAMP；只是起步太慢时再增加它。
+ *    - 左右摆动：先降低 BASE_SPEED，再小幅调整 LINE_KP / LINE_KD。
+ *    - 保持 MIN_BASE_SPEED 不大于 BASE_SPEED；提高 PWM_MAX 前确认硬件额定值。
  *
- *  第二部分（B）是**结构常量**：方向标定、保护开关、缓冲区、波特率、
- *  刷新周期等，改完必须重新编译。
+ *  在线试参数（USART2，115200，命令后按回车）：
+ *    SET BASE_SPEED 8       临时设置，数值会限制在合法范围内
+ *    GET BASE_SPEED         查询当前值
+ *    DUMP                   查看全部参数及范围
+ *    RESET                  恢复下方 CAR_* 默认值
  *
- *  工作流：
- *    改 A 区 → 只在调试时试算新值时，可以先 `SET 名字 值` 在线试，
- *             满意了再写回 A 区并重新编译（否则断电就丢）
- *    改 B 区 → 必须 Build + flash.ps1
+ *  A 区是串口 SET 支持的运行参数；这里的 CAR_* 是上电默认值。
+ *  在线 SET 只在本次运行有效，确认效果后把值写回 A 区并重新编译烧录。
  *
- *  谁用到参数，就在谁的 .c 文件里显式 include 本文件，不要依赖传递包含。
+ *  B 区是硬件/功能结构常量：方向标定、保护开关、缓冲区、波特率等；
+ *  修改后需要重新编译烧录，不支持串口 SET。
+ *
+ *  单位：速度是每个 10 ms 控制周期的编码器计数；PWM 是占空比百分比。
+ *  参数范围以 DUMP 输出为准；不要一次大幅改多个参数，便于比较效果。
  */
 
 /* ==========================================================================
- * A. 参数默认值（36 项）—— 与运行参数表一一对应，顺序同 `DUMP` 输出
+ * A. 运行参数默认值（36 项）—— 与串口 DUMP 参数表对应
  *
- *    格式： #define CAR_<名字>  <默认值>   行尾注释写 SET 名 | 范围 | 说明
- *    单位：速度为"每 10 ms 控制周期的编码器计数"，PWM 为 0~99 的占空比百分比
+ *    调参顺序建议：速度/转向 → 循迹 PD → 轮速 PI/前馈 → 找线/保护。
+ *    先调一项、低速试跑、确认稳定后再调下一项。
  * ========================================================================== */
 
-/* ---- A1. 速度与转向 ------------------------------------------------------ */
+/* ---- A1. 常用：速度与转向 ------------------------------------------------ */
 
-#define CAR_BASE_SPEED             7.0f   /* BASE_SPEED        | 0~40    | 直道基础速度 */
-#define CAR_MIN_BASE_SPEED         4.0f   /* MIN_BASE_SPEED    | 0~40    | 弯道降速下限 */
-#define CAR_SPEED_RAMP             0.5f   /* SPEED_RAMP        | 0.05~5  | 加减速斜坡步长 */
-#define CAR_CURVE_SLOWDOWN         1.5f   /* CURVE_SLOWDOWN    | 0~5     | 偏差越大降速越多 */
-#define CAR_MAX_WHEEL_TARGET      20.0f   /* MAX_WHEEL_TARGET  | 0~100   | 单轮目标速度上限 */
-#define CAR_MAX_TURN               6.0f   /* MAX_TURN          | 0~30    | 差速转向最大增量 */
+#define CAR_BASE_SPEED             22.0f   /* BASE_SPEED：直道目标速度；增大可提速。范围 0~40 */
+#define CAR_MIN_BASE_SPEED         4.0f    /* MIN_BASE_SPEED：弯道最低速度；太快就降低。范围 0~40，需 <= BASE_SPEED */
+#define CAR_SPEED_RAMP             0.5f    /* SPEED_RAMP：每 10 ms 加速步长；越大起步越快。范围 0.05~5 */
+#define CAR_CURVE_SLOWDOWN         1.5f    /* CURVE_SLOWDOWN：偏差越大降速越多；范围 0~5 */
+#define CAR_MAX_WHEEL_TARGET      40.0f    /* MAX_WHEEL_TARGET：单轮速度上限；BASE_SPEED 被卡住时检查此项。范围 0~100 */
+#define CAR_MAX_TURN               20.0f    /* MAX_TURN：转向差速上限；太迟钝可加，摆动大可减。范围 0~30 */
 
-/* ---- A2. 循迹 PD（外环）------------------------------------------------- */
+/* ---- A2. 循迹：PD 外环 --------------------------------------------------- */
 
-#define CAR_LINE_KP                1.1f   /* LINE_KP           | 0~20    | 比例：跟线紧度 */
-#define CAR_LINE_KD                10.0f   /* LINE_KD           | 0~20    | 微分：抑制过冲 */
-#define CAR_LINE_FILTER_ALPHA      0.6f   /* LINE_FILTER_ALPHA | 0.05~1  | 偏差 EMA 滤波，τ=-10/ln(α) ms：0.9→95ms,0.6→20ms */
-#define CAR_LINE_D_ALPHA          0.35f   /* LINE_D_ALPHA      | 0.05~1  | 微分项滤波 */
-#define CAR_LINE_DEADBAND         0.15f   /* LINE_DEADBAND     | 0~4     | 死区（台阶比它大时无效） */
-#define CAR_LINE_AVG_DEFAULT         0U   /* LINE_AVG          | 0~1     | 1=启用滑动平均滤波 */
+#define CAR_LINE_KP                1.0f    /* LINE_KP：比例纠偏力度；太迟钝可加，左右摆动可减。范围 0~20 */
+#define CAR_LINE_KD               20.0f    /* LINE_KD：抑制转向过冲；太敏感/抖动可减。范围 0~20 */
+#define CAR_LINE_FILTER_ALPHA      0.6f    /* LINE_FILTER_ALPHA：偏差滤波；越大响应越快、越小越平滑。范围 0.05~1 */
+#define CAR_LINE_D_ALPHA           0.35f   /* LINE_D_ALPHA：微分滤波；越大响应越快，也更容易受噪声影响。范围 0.05~1 */
+#define CAR_LINE_DEADBAND          0.15f   /* LINE_DEADBAND：小于此偏差时减弱比例纠偏；范围 0~4 */
+#define CAR_LINE_AVG_DEFAULT       1U      /* LINE_AVG：0 关闭、1 开启额外滑动平均。范围 0~1 */
 
-/* ---- A3. 轮速环 PI（内环）----------------------------------------------- */
+/* ---- A3. 轮速：PI 内环与电机前馈 ---------------------------------------- */
 
-#define CAR_WHEEL_KP              1.05f   /* WHEEL_KP          | 0~10    | 速度环比例 */
-#define CAR_WHEEL_KI              0.70f   /* WHEEL_KI          | 0~2     | 速度环积分 */
-#define CAR_WHEEL_I_LIMIT         10.0f   /* WHEEL_I_LIMIT     | 0~40    | 积分限幅 */
-#define CAR_WHEEL_FILTER_ALPHA    0.45f   /* WHEEL_FILTER_ALPHA| 0.05~1  | 测速滤波 */
-#define CAR_LEFT_START_PWM        13.0f   /* LEFT_START_PWM    | 0~60    | 左轮起步死区补偿 */
-#define CAR_RIGHT_START_PWM       13.0f   /* RIGHT_START_PWM   | 0~60    | 右轮起步死区补偿 */
-#define CAR_LEFT_PWM_PER_COUNT     0.8f   /* LEFT_PWM_PER_COUNT | 0~3    | 左轮 PWM/计数 前馈 */
-#define CAR_RIGHT_PWM_PER_COUNT    0.8f   /* RIGHT_PWM_PER_COUNT| 0~3    | 右轮 PWM/计数 前馈 */
-#define CAR_PWM_MAX                 38    /* PWM_MAX           | 1~99    | PWM 上限 */
+#define CAR_WHEEL_KP              1.05f   /* WHEEL_KP：轮速比例；范围 0~10 */
+#define CAR_WHEEL_KI              0.70f   /* WHEEL_KI：轮速积分；持续有速度误差时才考虑调整。范围 0~2 */
+#define CAR_WHEEL_I_LIMIT        10.0f    /* WHEEL_I_LIMIT：积分限幅；范围 0~40 */
+#define CAR_WHEEL_FILTER_ALPHA    0.45f   /* WHEEL_FILTER_ALPHA：测速滤波；大=响应快，小=更平滑。范围 0.05~1 */
+#define CAR_LEFT_START_PWM       13.0f    /* LEFT_START_PWM：左轮起步补偿；单侧起步无力时小幅增加。范围 0~60 */
+#define CAR_RIGHT_START_PWM      13.0f    /* RIGHT_START_PWM：右轮起步补偿；单侧起步无力时小幅增加。范围 0~60 */
+#define CAR_LEFT_PWM_PER_COUNT    0.8f    /* LEFT_PWM_PER_COUNT：左轮速度前馈；范围 0~3 */
+#define CAR_RIGHT_PWM_PER_COUNT   0.8f    /* RIGHT_PWM_PER_COUNT：右轮速度前馈；范围 0~3 */
+#define CAR_PWM_MAX                99     /* PWM_MAX：电机输出上限；提高前确认电机/驱动板额定值。范围 1~99 */
 
-/* ---- A4. 找线（丢线后自救）--------------------------------------------- */
+/* ---- A4. 丢线后找线 ------------------------------------------------------ */
 
-#define CAR_LINE_SEARCH_SPEED      6.0f   /* SEARCH_SPEED      | 0~20    | 找线速度 */
-#define CAR_LINE_SEARCH_TURN_RATIO 0.8f   /* SEARCH_TURN_RATIO | 0~1     | 找线打方向力度 */
-#define CAR_LINE_SEARCH_MID_FRAMES   30U  /* SEARCH_MID        | 0~500   | 中间丢线先直行帧数 */
-#define CAR_LINE_SEARCH_SIDE_FRAMES   8U  /* SEARCH_SIDE       | 0~500   | 边上丢线先等待帧数 */
-#define CAR_LINE_SEARCH_TURN_FRAMES  40U  /* SEARCH_TURN       | 0~500   | 朝一个方向找多久 */
-#define CAR_LINE_SEARCH_SWEEP_FRAMES 25U  /* SEARCH_SWEEP      | 1~500   | 左右交替周期 */
+#define CAR_LINE_SEARCH_SPEED       6.0f  /* SEARCH_SPEED：找线时的速度；范围 0~20 */
+#define CAR_LINE_SEARCH_TURN_RATIO  0.8f  /* SEARCH_TURN_RATIO：找线转向力度比例；范围 0~1 */
+#define CAR_LINE_SEARCH_MID_FRAMES 30U    /* SEARCH_MID：中间丢线后先直行的帧数；每帧 10 ms。范围 0~500 */
+#define CAR_LINE_SEARCH_SIDE_FRAMES 8U    /* SEARCH_SIDE：边缘丢线后先直行的帧数；每帧 10 ms。范围 0~500 */
+#define CAR_LINE_SEARCH_TURN_FRAMES 40U   /* SEARCH_TURN：向最后见线方向搜索的帧数；每帧 10 ms。范围 0~500 */
+#define CAR_LINE_SEARCH_SWEEP_FRAMES 25U  /* SEARCH_SWEEP：左右交替搜索的周期帧数；每帧 10 ms。范围 1~500 */
 
-/* ---- A5. 保护阈值 ------------------------------------------------------- */
+/* ---- A5. 保护与起步判定 -------------------------------------------------- */
 
-#define CAR_STALL_FRAMES           25U    /* STALL_FRAMES      | 0~250   | 堵转判定帧数 */
-#define CAR_STALL_PWM              24U    /* STALL_PWM         | 0~99    | 堵转判定 PWM 阈值 */
-#define CAR_REVERSE_FRAMES          4U    /* REVERSE_FRAMES    | 0~200   | 反转判定帧数 */
-#define CAR_VALID_FRAMES            3U    /* VALID_FRAMES      | 1~50    | 起步要求的连续有效帧 */
-#define CAR_INVALID_FRAMES          3U    /* INVALID_FRAMES    | 1~50    | 判坏帧数 */
-#define CAR_STOP_FRAMES             3U    /* STOP_FRAMES       | 1~50    | KEY2 去抖帧数 */
+#define CAR_STALL_FRAMES           25U    /* STALL_FRAMES：堵转判定帧数；每帧 10 ms。范围 0~250 */
+#define CAR_STALL_PWM              24U    /* STALL_PWM：高于此 PWM 且无编码器计数时累计堵转。范围 0~99 */
+#define CAR_REVERSE_FRAMES          4U    /* REVERSE_FRAMES：编码器反向判定帧数；每帧 10 ms。范围 0~200 */
+#define CAR_VALID_FRAMES            3U    /* VALID_FRAMES：起步前要求连续看到有效线的帧数。范围 1~50 */
+#define CAR_INVALID_FRAMES          3U    /* INVALID_FRAMES：连续无效线判定帧数。范围 1~50 */
+#define CAR_STOP_FRAMES             3U    /* STOP_FRAMES：KEY2 去抖帧数；范围 1~50 */
 
-/* ---- A6. 通信与日志 ----------------------------------------------------- */
+/* ---- A6. 串口输出与日志 -------------------------------------------------- */
 
-#define CAR_TELEMETRY_MS_DEFAULT   100U   /* TELEMETRY_MS      | 0~5000  | 遥测周期 ms，0=关 */
-#define CAR_PARAMS_MS_DEFAULT     1000U   /* PARAMS_MS         | 0~60000 | 参数打印周期 ms（很吵） */
-#define CAR_LOG_ENABLE_DEFAULT       1U   /* LOG_ENABLE        | 0~1     | 文本日志开关 */
+#define CAR_TELEMETRY_MS_DEFAULT  100U    /* TELEMETRY_MS：运行遥测间隔 ms；0=关闭。范围 0~5000 */
+#define CAR_PARAMS_MS_DEFAULT    1000U    /* PARAMS_MS：重复打印参数间隔 ms；0=关闭，减少串口占用。范围 0~60000 */
+#define CAR_LOG_ENABLE_DEFAULT      1U    /* LOG_ENABLE：默认文本日志开关；0=关，1=开。范围 0~1 */
 
 /* ==========================================================================
  * B. 结构常量（改完必须重新编译）

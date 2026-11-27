@@ -764,7 +764,9 @@ static void CardMatch_Reset(void)
  *   3. detect = 1 且车在跑时，把非 NONE 的 card_name 依次存进 card1..card12；
  *   4. 记满 card1..card6 时算出 target_card1..3；
  *   5. 之后每张卡和 target 比数字部分：命中就立刻停车（不倒转）+ 蜂鸣 1 s +
- *      2 s 后起步，没命中就关 detect，等 wait_time 后再开。
+ *      2 s 后起步，没命中就关 detect，等 wait_time 后再开；
+ *   6. detect_number >= 12 后检测结束，不再记录/比对，正常行驶到
+ *      cross_count == cross_target 再停车。
  */
 static void CardMatch_Poll(void)
 {
@@ -787,11 +789,17 @@ static void CardMatch_Poll(void)
         CarControl_Resume(&car);
         __set_PRIMASK(irq_state);
         detect = 0;
-        detect_waiting = true;
-        detect_resume_ms = now + wait_time;
-        log_info("[CARD4] restart, detect off for %lu ms", (unsigned long)wait_time);
+        if (detect_number >= CAR_MATCH_SLOTS) {
+            detect_waiting = false;     /* 12 张已记满，起步后不再检测 */
+        } else {
+            detect_waiting = true;
+            detect_resume_ms = now + wait_time;
+            log_info("[CARD4] restart, detect off for %lu ms",
+                     (unsigned long)wait_time);
+        }
     }
 
+    /* 12 张记满：检测阶段结束，之后只正常行驶，等 cross_count 到 cross_target */
     if (detect_number >= CAR_MATCH_SLOTS) {
         detect = 0;
         detect_waiting = false;
@@ -828,10 +836,15 @@ static void CardMatch_Poll(void)
     ++detect_number;
     if (detect_number >= CAR_MATCH_SLOTS) {
         detect = 0;
+        detect_waiting = false;
     }
     __set_PRIMASK(irq_state);
 
     log_info("[CARD4] #%u %s n=%d", (unsigned)detect_number, name, (int)number);
+    if (detect_number >= CAR_MATCH_SLOTS) {
+        log_info("[CARD4] %u cards recorded, detection finished, run to cross_target",
+                 (unsigned)detect_number);
+    }
 
     /* 算目标用的就是刚记满的这 6 张，所以第 6 张本身不参与比对 */
     compare_card = (detect_number != CAR_CARD_SLOTS);
