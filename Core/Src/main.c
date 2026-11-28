@@ -139,10 +139,32 @@ static char card3[CAR_CARD_TEXT_MAX];
 static char card4[CAR_CARD_TEXT_MAX];
 static char card5[CAR_CARD_TEXT_MAX];
 static char card6[CAR_CARD_TEXT_MAX];
+static char card7[CAR_CARD_TEXT_MAX];
+static char card8[CAR_CARD_TEXT_MAX];
+static char card9[CAR_CARD_TEXT_MAX];
+static char card10[CAR_CARD_TEXT_MAX];
+static char card11[CAR_CARD_TEXT_MAX];
+static char card12[CAR_CARD_TEXT_MAX];
 /* detect_number 从 0 开始，所以 card(detect_number + 1) == cards[detect_number] */
 static char *const cards[CAR_CARD_SLOTS] = {
     card1, card2, card3, card4, card5, card6
 };
+/* mode 4 用 1..12 号槽，编号规则同上 */
+static char *const match_cards[CAR_MATCH_SLOTS] = {
+    card1, card2, card3, card4, card5, card6,
+    card7, card8, card9, card10, card11, card12
+};
+
+/* ---- mode 4：视觉卡片匹配 ------------------------------------------------
+ * 前 6 张（card1..card6）算出 target_card1..3（6 选 3 求和的过半组），
+ * 之后每张卡和 target 比数字部分：命中就停车，并把序号最小的命中目标清零。
+ */
+static int16_t target_card1;
+static int16_t target_card2;
+static int16_t target_card3;
+static bool match_restart_pending;   /* 命中后停车中，到点自动起步 */
+static uint32_t match_restart_ms;
+static uint8_t match_hit_index;      /* 命中的 target 序号 1..3，0 = 无 */
 static bool detect_waiting;          /* detect 已清 0，等冷却结束再置 1 */
 static uint32_t detect_resume_ms;
 static bool card_restart_pending;    /* S/C 卡停车中，到点自动起步 */
@@ -150,6 +172,7 @@ static uint32_t card_restart_ms;
 static bool buzzer_active;           /* 蜂鸣器正在响（1 s 后自己关） */
 static uint32_t buzzer_off_ms;
 static bool cards_view;              /* OLED 正在显示卡片网格 */
+static bool cards_latched;           /* mode 3 压过线后锁住卡片页，直到切模式 */
 
 #define APPLICATION_TASK_STACK_WORDS 768U
 #define DISPLAY_TASK_STACK_WORDS     512U
@@ -177,6 +200,8 @@ static void Vision_Poll(void);
 static void PrintVofaFrame(void);
 static int16_t CardNumber(const volatile char *name);
 static void ApplyMode(uint8_t m);
+static void CardMatch_Reset(void);
+static void CardMatch_Poll(void);
 static void Timers_Match20Timing(void);
 static void ApplicationTask(void *argument);
 static void DisplayTask(void *argument);
@@ -491,13 +516,24 @@ static void CardDetect_Reset(void)
     log_info("[CARD] slots cleared, detect re-armed");
 }
 
-/* 离开 mode 3 / 本轮结束：取消停车等待、关蜂鸣器、恢复检测 */
+/* 离开 mode 3 / 4 / 本轮结束：取消停车等待、关蜂鸣器、恢复检测 */
 static void CardDetect_Cancel(void)
 {
     card_restart_pending = false;
+    match_restart_pending = false;
+    match_hit_index = 0;
     detect_waiting = false;
     detect = 1;
     if (buzzer_active) {
+        buzzer_active = false;
+        Buzzer_Off();
+    }
+}
+
+/* 蜂鸣器响满 CAR_CARD_BEEP_MS 自动关（mode 3 / 4 共用） */
+static void CardBeep_Poll(void)
+{
+    if (buzzer_active && (int32_t)(HAL_GetTick() - buzzer_off_ms) >= 0) {
         buzzer_active = false;
         Buzzer_Off();
     }
@@ -517,10 +553,7 @@ static void CardDetect_Poll(void)
     uint32_t irq_state;
     unsigned i;
 
-    if (buzzer_active && (int32_t)(now - buzzer_off_ms) >= 0) {
-        buzzer_active = false;
-        Buzzer_Off();
-    }
+    CardBeep_Poll();
 
     if (card_restart_pending && (int32_t)(now - card_restart_ms) >= 0) {
         card_restart_pending = false;
@@ -599,6 +632,253 @@ static void CardDetect_Poll(void)
     }
 }
 
+/* 返回命中的 target 序号（1..3），没命中返回 0；已经用掉（=0）的目标不参与匹配 */
+static uint8_t MatchTargetFind(int16_t number)
+{
+    if (number <= 0) {
+        return 0U;
+    }
+    if (target_card1 != 0 && number == target_card1) {
+        return 1U;
+    }
+    if (target_card2 != 0 && number == target_card2) {
+        return 2U;
+    }
+    if (target_card3 != 0 && number == target_card3) {
+        return 3U;
+    }
+    return 0U;
+}
+
+static void MatchTargetClear(uint8_t index)
+{
+    switch (index) {
+    case 1U: target_card1 = 0; break;
+    case 2U: target_card2 = 0; break;
+    case 3U: target_card3 = 0; break;
+    default: break;
+    }
+}
+
+/*
+ * card1..card6 记满 6 张后算目标：
+ *   s = card1..6 的数字部分之和；
+ *   6 选 3 共 20 组求和，从低到高排序；
+ *   取第一个 > s/2 的组（整数比较用 2*result > s），把它的 3 张卡的数字部分
+ *   分别存进 target_card1、target_card2、target_card3。
+ */
+static void CardMatch_ComputeTargets(void)
+{
+    static const uint8_t pick[CAR_MATCH_COMBOS][CAR_MATCH_PICK] = {
+        {0U, 1U, 2U}, {0U, 1U, 3U}, {0U, 1U, 4U}, {0U, 1U, 5U},
+        {0U, 2U, 3U}, {0U, 2U, 4U}, {0U, 2U, 5U},
+        {0U, 3U, 4U}, {0U, 3U, 5U}, {0U, 4U, 5U},
+        {1U, 2U, 3U}, {1U, 2U, 4U}, {1U, 2U, 5U},
+        {1U, 3U, 4U}, {1U, 3U, 5U}, {1U, 4U, 5U},
+        {2U, 3U, 4U}, {2U, 3U, 5U}, {2U, 4U, 5U},
+        {3U, 4U, 5U}
+    };
+    int16_t numbers[CAR_CARD_SLOTS];
+    int16_t result[CAR_MATCH_COMBOS];   /* 20 组和，排序后从低到高 */
+    uint8_t order[CAR_MATCH_COMBOS];    /* 每组和对应 pick[] 的下标 */
+    int16_t s = 0;
+    int32_t sum;
+    unsigned i;
+    unsigned j;
+
+    for (i = 0; i < CAR_CARD_SLOTS; ++i) {
+        numbers[i] = CardNumber(cards[i]);
+        s = (int16_t)(s + numbers[i]);
+    }
+
+    for (i = 0; i < CAR_MATCH_COMBOS; ++i) {
+        sum = 0;
+        for (j = 0; j < CAR_MATCH_PICK; ++j) {
+            sum += numbers[pick[i][j]];
+        }
+        result[i] = (int16_t)sum;
+        order[i] = (uint8_t)i;
+    }
+
+    /* 插入排序：20 个元素，比 qsort 省栈 */
+    for (i = 1; i < CAR_MATCH_COMBOS; ++i) {
+        int16_t key = result[i];
+        uint8_t key_order = order[i];
+
+        j = i;
+        while (j > 0U && result[j - 1U] > key) {
+            result[j] = result[j - 1U];
+            order[j] = order[j - 1U];
+            --j;
+        }
+        result[j] = key;
+        order[j] = key_order;
+    }
+
+    target_card1 = 0;
+    target_card2 = 0;
+    target_card3 = 0;
+    for (i = 0; i < CAR_MATCH_COMBOS; ++i) {
+        if ((int32_t)result[i] * 2 > (int32_t)s) {
+            target_card1 = numbers[pick[order[i]][0]];
+            target_card2 = numbers[pick[order[i]][1]];
+            target_card3 = numbers[pick[order[i]][2]];
+            log_info("[CARD4] s=%d result[%u]=%d -> targets %d/%d/%d",
+                     (int)s, i, (int)result[i],
+                     (int)target_card1, (int)target_card2, (int)target_card3);
+            return;
+        }
+    }
+    log_warn("[CARD4] no combo > s/2 (s=%d), targets stay 0", (int)s);
+}
+
+/* 进入 mode 4：清空 card1..card12 和 target_card1..3，从第一张重新记 */
+static void CardMatch_Reset(void)
+{
+    unsigned i;
+    unsigned j;
+    uint32_t irq_state = __get_PRIMASK();
+
+    __disable_irq();
+    for (i = 0; i < CAR_MATCH_SLOTS; ++i) {
+        for (j = 0; j < CAR_CARD_TEXT_MAX; ++j) {
+            match_cards[i][j] = '\0';
+        }
+    }
+    detect_number = 0;
+    target_card1 = 0;
+    target_card2 = 0;
+    target_card3 = 0;
+    match_restart_pending = false;
+    match_hit_index = 0;
+    __set_PRIMASK(irq_state);
+
+    log_info("[CARD4] card1..card%u cleared, targets reset",
+             (unsigned)CAR_MATCH_SLOTS);
+}
+
+/*
+ * mode 4 的卡片状态机（主循环里每 1 ms 跑一次，不阻塞）：
+ *   1. 命中后停车满 CAR_MATCH_STOP_MS 自动起步，清零命中的目标并冷却 detect；
+ *   2. 冷却结束把 detect 置 1；
+ *   3. detect = 1 且车在跑时，把非 NONE 的 card_name 依次存进 card1..card12；
+ *   4. 记满 card1..card6 时算出 target_card1..3；
+ *   5. 之后每张卡和 target 比数字部分：命中就立刻停车（不倒转）+ 蜂鸣 1 s +
+ *      2 s 后起步，没命中就关 detect，等 wait_time 后再开；
+ *   6. detect_number >= 12 后检测结束，不再记录/比对，正常行驶到
+ *      cross_count == cross_target 再停车。
+ */
+static void CardMatch_Poll(void)
+{
+    char name[CAR_CARD_TEXT_MAX];
+    int16_t number;
+    uint8_t hit;
+    bool compare_card;
+    uint32_t now = HAL_GetTick();
+    uint32_t irq_state;
+    unsigned i;
+
+    CardBeep_Poll();
+
+    if (match_restart_pending && (int32_t)(now - match_restart_ms) >= 0) {
+        match_restart_pending = false;
+        MatchTargetClear(match_hit_index);
+        match_hit_index = 0;
+        irq_state = __get_PRIMASK();
+        __disable_irq();
+        CarControl_Resume(&car);
+        __set_PRIMASK(irq_state);
+        detect = 0;
+        if (detect_number >= CAR_MATCH_SLOTS) {
+            detect_waiting = false;     /* 12 张已记满，起步后不再检测 */
+        } else {
+            detect_waiting = true;
+            detect_resume_ms = now + wait_time;
+            log_info("[CARD4] restart, detect off for %lu ms",
+                     (unsigned long)wait_time);
+        }
+    }
+
+    /* 12 张记满：检测阶段结束，之后只正常行驶，等 cross_count 到 cross_target */
+    if (detect_number >= CAR_MATCH_SLOTS) {
+        detect = 0;
+        detect_waiting = false;
+    } else if (detect_waiting && (int32_t)(now - detect_resume_ms) >= 0) {
+        detect_waiting = false;
+        detect = 1;
+    }
+
+    if (!detect || match_restart_pending) {
+        return;
+    }
+    /* 车没在跑就不记：停车时视觉还对着同一张卡，会重复记 */
+    if (telemetry.status != CAR_RUNNING && telemetry.status != CAR_SEARCH) {
+        return;
+    }
+
+    irq_state = __get_PRIMASK();
+    __disable_irq();
+    for (i = 0; i < CAR_CARD_TEXT_MAX; ++i) {
+        name[i] = card_name[i];
+    }
+    __set_PRIMASK(irq_state);
+
+    if (strcmp(name, "NONE") == 0 || detect_number >= CAR_MATCH_SLOTS) {
+        return;
+    }
+
+    irq_state = __get_PRIMASK();
+    __disable_irq();
+    for (i = 0; i < CAR_CARD_TEXT_MAX; ++i) {
+        match_cards[detect_number][i] = name[i];   /* card(detect_number + 1) */
+    }
+    number = CardNumber(match_cards[detect_number]);
+    ++detect_number;
+    if (detect_number >= CAR_MATCH_SLOTS) {
+        detect = 0;
+        detect_waiting = false;
+    }
+    __set_PRIMASK(irq_state);
+
+    log_info("[CARD4] #%u %s n=%d", (unsigned)detect_number, name, (int)number);
+    if (detect_number >= CAR_MATCH_SLOTS) {
+        log_info("[CARD4] %u cards recorded, detection finished, run to cross_target",
+                 (unsigned)detect_number);
+    }
+
+    /* 算目标用的就是刚记满的这 6 张，所以第 6 张本身不参与比对 */
+    compare_card = (detect_number != CAR_CARD_SLOTS);
+    if (detect_number == CAR_CARD_SLOTS) {
+        CardMatch_ComputeTargets();
+    }
+
+    hit = compare_card ? MatchTargetFind(number) : 0U;
+    if (hit != 0U) {
+        irq_state = __get_PRIMASK();
+        __disable_irq();
+        CarControl_StopNow(&car);      /* 立刻停车，不倒转 */
+        __set_PRIMASK(irq_state);
+
+        Buzzer_Set(true);
+        buzzer_active = true;
+        buzzer_off_ms = now + CAR_CARD_BEEP_MS;
+        match_hit_index = hit;
+        match_restart_pending = true;
+        match_restart_ms = now + CAR_MATCH_STOP_MS;
+        detect = 0;
+        detect_waiting = false;
+        log_info("[CARD4] %s hits target_card%u, stop %u ms, beep %u ms",
+                 name, (unsigned)hit, (unsigned)CAR_MATCH_STOP_MS,
+                 (unsigned)CAR_CARD_BEEP_MS);
+    } else {
+        detect = 0;
+        detect_waiting = true;
+        detect_resume_ms = now + wait_time;
+        log_info("[CARD4] %s -> detect off for %lu ms", name,
+                 (unsigned long)wait_time);
+    }
+}
+
 /* 切换 mode 时设定：目标压线次数 + 启动延时 */
 static void ApplyMode(uint8_t m)
 {
@@ -609,20 +889,26 @@ static void ApplyMode(uint8_t m)
     car.start_pending = false;
     car.start_delay_ms = start_delay_ms;
     cross_done = false;
+    cards_latched = false;            /* 换模式后重新判定要不要显示卡片页 */
 
     if (m == 2U) {
         cross_target = 0;             /* mode2：等 KEY1 之后从卡片取 */
         cross_target_valid = false;
+    } else if (m == 4U) {
+        cross_target = CAR_MATCH_LAP_TARGET;   /* mode4：跑 2 圈后停车 */
+        cross_target_valid = true;
     } else {
-        cross_target = 1;             /* mode1 / 3 / 4：固定 1 次 */
+        cross_target = 1;             /* mode1 / 3：固定 1 次 */
         cross_target_valid = true;
     }
     __set_PRIMASK(irq_state);
 
-    /* mode 3 进来先清空卡片；其它模式把停车/鸣叫/等待全部取消 */
+    /* mode 3 / 4 进来先清空卡片；其它模式把停车/鸣叫/等待全部取消 */
     CardDetect_Cancel();
     if (m == 3U) {
         CardDetect_Reset();
+    } else if (m == 4U) {
+        CardMatch_Reset();
     }
 
     log_info("[MODE] %u  target=%d valid=%d delay=%u ms",
@@ -702,8 +988,11 @@ static void RefreshDisplay(void)
     display_cross_target_valid = cross_target_valid;
     __set_PRIMASK(irq_state);
 
-    /* mode 3 压线一次后：整屏清空，改显示 6 张卡片 */
-    show_cards = (display_mode == 3U) && (data.cross_count == 1);
+    /* mode 3 只要 cross_count >= 1：整屏清空，改显示 6 张卡片，并且一直保持 */
+    if (display_mode == 3U && data.cross_count >= 1) {
+        cards_latched = true;
+    }
+    show_cards = (display_mode == 3U) && cards_latched;
     if (show_cards != cards_view) {
         OLED_Clear();
         cards_view = show_cards;
@@ -985,6 +1274,9 @@ static void ApplicationTask(void *argument)
         /* mode 3：记卡片、S/C 停车 + 蜂鸣 + 2 s 后自动起步 */
         if (mode == 3U) {
             CardDetect_Poll();
+        } else if (mode == 4U) {
+            /* mode 4：记 12 张卡，前 6 张算目标，后 6 张命中就停车 */
+            CardMatch_Poll();
         }
 
         if ((telemetry.status == CAR_RUNNING || telemetry.status == CAR_SEARCH) &&
@@ -995,7 +1287,7 @@ static void ApplicationTask(void *argument)
             CarControl_Stop(&car);
             __set_PRIMASK(primask);
             cross_done = true;
-            if (mode == 3U) {
+            if (mode == 3U || mode == 4U) {
                 CardDetect_Cancel();   /* 本轮跑完，不再自动起步 */
             }
             log_info("[TARGET] cross_count=%d reached target %d, car stopped",
